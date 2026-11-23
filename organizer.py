@@ -2,6 +2,8 @@ import argparse
 import logging
 import os
 import shutil
+import sys
+from pathlib import Path
 
 
 CATEGORIES = {
@@ -12,7 +14,7 @@ CATEGORIES = {
     "Documents": [".docx", ".txt"],
 }
 CATEGORY_NAMES = list(CATEGORIES) + ["Others"]
-PROTECTED_FILENAMES = {"organizer.py", "readme.md", ".gitignore"}
+PROTECTED_FILENAMES = {"organizer.py", "readme.md", ".gitignore", "requirements.txt"}
 PROTECTED_EXTENSIONS = {".py"}
 
 
@@ -77,6 +79,45 @@ def make_summary():
     }
 
 
+def notify_event(callback, event_type, message, **details):
+    """Send an optional event to a UI or other caller."""
+    if callback:
+        callback({"type": event_type, "message": message, **details})
+
+
+def scan_folder(folder, log_file="organizer.log"):
+    """Build a read-only list of proposed destinations for one folder level."""
+    plan = {"folder": os.path.abspath(folder), "items": [], "directories": []}
+    files = os.listdir(folder)
+    for index, filename in enumerate(files):
+        source = os.path.abspath(os.path.join(folder, filename))
+        extension = os.path.splitext(filename)[1] or "(none)"
+        try:
+            if os.path.isdir(source):
+                plan["directories"].append(source)
+                continue
+            if is_protected_file(folder, filename, log_file):
+                plan["items"].append({
+                    "index": index, "name": filename, "extension": extension,
+                    "category": "—", "source": source, "destination": "—",
+                    "status": "Skipped", "message": "Protected file",
+                })
+                continue
+            category = get_category(filename)
+            destination = get_unique_destination(os.path.join(folder, category), filename)
+            plan["items"].append({
+                "index": index, "name": filename, "extension": extension,
+                "category": category, "source": source,
+                "destination": os.path.abspath(destination),
+                "status": "Ready", "message": "",
+            })
+        except OSError as error:
+            plan["items"].append({
+                "index": index, "name": filename, "extension": extension,
+                "category": "—", "source": source, "destination": "—",
+                "status": "Error", "message": str(error),
+            })
+    return plan
 def print_summary(summary, dry_run=False):
     """Print a short report of the operation."""
     mode = "Preview (no changes made)" if dry_run else "Organization complete"
@@ -121,87 +162,147 @@ def get_folder_error_message(folder, error):
     return f"Could not read folder '{folder}': {error}"
 
 
-def organize_folder(folder="test_folder", dry_run=False, log_file="organizer.log"):
+def get_default_log_file():
+    """Return a writable per-user log path for GUI and CLI runs."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        log_directory = Path(local_app_data).expanduser() / "SmartFileOrganizer"
+    else:
+        log_directory = Path.home() / ".smart-file-organizer"
+    log_directory.mkdir(parents=True, exist_ok=True)
+    return log_directory / "organizer.log"
+
+
+def organize_folder(
+    folder="test_folder",
+    dry_run=False,
+    log_file="organizer.log",
+    event_callback=None,
+    progress_callback=None,
+    print_report=True,
+    print_output=True,
+):
     """Preview or organize top-level files and return their operation counts."""
     summary = make_summary()
     logger = None
     handler = None
 
-    # Preview does not create or update the log, keeping it read-only.
+    def finish():
+        if print_report:
+            print_summary(summary, dry_run)
+        if handler:
+            handler.close()
+        return summary
+
     if not dry_run:
         try:
             logger, handler = create_logger(log_file)
         except OSError as error:
-            print(f"Error: cannot create log file '{log_file}': {error}")
             summary["failed"] += 1
-            return finish_operation(summary, dry_run, handler)
+            message = f"Cannot create log file '{log_file}': {error}"
+            if print_output:
+                print(f"Error: {message}")
+            notify_event(event_callback, "error", message)
+            return finish()
 
     try:
         files = os.listdir(folder)
     except OSError as error:
+        summary["failed"] += 1
         message = get_folder_error_message(folder, error)
-        print(f"Error: {message}")
+        if print_output:
+            print(f"Error: {message}")
         if logger:
             logger.error("%s", message)
-        summary["failed"] += 1
-        return finish_operation(summary, dry_run, handler)
+        notify_event(event_callback, "error", message)
+        return finish()
 
     if not files:
-        print(f"Folder is empty: {folder}")
+        if print_output:
+            print(f"Folder is empty: {folder}")
         if logger:
             logger.info("Folder is empty: %s", folder)
-        return finish_operation(summary, dry_run, handler)
+        notify_event(event_callback, "empty", f"Folder is empty: {folder}")
+        return finish()
 
-    for filename in files:
-        source = os.path.join(folder, filename)
-
+    for index, filename in enumerate(files):
+        source = os.path.abspath(os.path.join(folder, filename))
+        item = {"source": source, "name": filename}
         try:
-            # Match the existing behavior: do not enter nested directories.
             if os.path.isdir(source):
                 summary["directories_skipped"] += 1
                 if logger:
                     logger.info("SKIPPED directory: %s", source)
+                notify_event(event_callback, "skipped", f"Skipped directory: {filename}")
                 continue
 
             summary["files_scanned"] += 1
-
             if is_protected_file(folder, filename, log_file):
                 summary["skipped"] += 1
                 if logger:
                     logger.info("SKIPPED protected file: %s", source)
+                item = {"source": source, "name": filename}
+                notify_event(
+                    event_callback, "skipped", f"Skipped protected file: {filename}",
+                    item=item, status="Skipped",
+                )
                 continue
 
             category = get_category(filename)
             category_folder = os.path.join(folder, category)
             destination = get_unique_destination(category_folder, filename)
+            item = {
+                "source": source,
+                "name": filename,
+                "extension": os.path.splitext(filename)[1] or "(none)",
+                "category": category,
+                "destination": os.path.abspath(destination),
+            }
 
             if dry_run:
                 summary["categories"][category] += 1
-                print(f"PREVIEW: {filename} -> {destination} ({category})")
+                if print_output:
+                    print(f"PREVIEW: {filename} -> {destination} ({category})")
+                notify_event(
+                    event_callback, "preview",
+                    f"Preview: {filename} -> {destination}",
+                    item=item, status="Preview",
+                )
                 continue
 
             os.makedirs(category_folder, exist_ok=True)
-            # Recheck after making the folder in case a file appeared meanwhile.
             destination = get_unique_destination(category_folder, filename)
             shutil.move(source, destination)
             summary["organized"] += 1
             summary["categories"][category] += 1
-            logger.info("SUCCESS: %s -> %s", source, destination)
+            item["destination"] = os.path.abspath(destination)
+            if logger:
+                logger.info("SUCCESS: %s -> %s", source, destination)
+            notify_event(
+                event_callback, "success", f"Moved {filename} to {category}",
+                item=item, status="Moved",
+            )
         except PermissionError as error:
             summary["failed"] += 1
             message = f"Permission denied for '{filename}': {error}"
-            print(f"Error: {message}")
+            if print_output:
+                print(f"Error: {message}")
             if logger:
                 logger.error("ERROR: %s", message)
+            notify_event(event_callback, "error", message, item=item, status="Error")
         except (OSError, shutil.Error) as error:
             summary["failed"] += 1
             message = f"Could not organize '{filename}': {error}"
-            print(f"Error: {message}")
+            if print_output:
+                print(f"Error: {message}")
             if logger:
                 logger.error("ERROR: %s", message)
+            notify_event(event_callback, "error", message, item=item, status="Error")
+        finally:
+            if progress_callback:
+                progress_callback(index + 1, len(files))
 
-    return finish_operation(summary, dry_run, handler)
-
+    return finish()
 
 def main():
     """Read command-line options and start the organizer."""
@@ -219,8 +320,8 @@ def main():
     )
     parser.add_argument(
         "--log-file",
-        default="organizer.log",
-        help="where to save the operation log (default: organizer.log)",
+        default=str(get_default_log_file()),
+        help="where to save the operation log (default: the per-user application data folder)",
     )
     args = parser.parse_args()
     organize_folder(args.folder, dry_run=args.dry_run, log_file=args.log_file)

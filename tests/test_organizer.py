@@ -195,6 +195,15 @@ class OrganizerTests(unittest.TestCase):
         self.assertIn("Cannot access folder", output.getvalue())
         self.assertEqual(summary["failed"], 1)
 
+    def test_project_requirements_file_is_not_organized(self):
+        requirements = self.create_file(self.folder, "requirements.txt", "customtkinter")
+        summary = organizer.organize_folder(
+            self.folder, log_file=self.log_file, print_report=False, print_output=False
+        )
+        self.assertTrue(os.path.isfile(requirements))
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["organized"], 0)
+
     def test_log_inside_target_is_not_organized(self):
         log_in_folder = os.path.join(self.folder, "organizer.log")
 
